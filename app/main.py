@@ -29,6 +29,11 @@ transaction (the exposure already counted is not rolled back), and new
 answers for it are rejected with 409 while a stored ``response_id``
 replay still returns the first result.
 
+``GET /api/sessions/{id}/similarity`` reviews one finished session against
+every other finished session for answer-sheet plagiarism: sheets are aligned
+by ``item_id``, only shared *wrong* options count as matches, and each match
+is weighted by how rare that wrong option is across finished sessions.
+
 Mutating endpoints use ``BEGIN IMMEDIATE`` so concurrent requests on the same
 SQLite database are serialised; exposure counts and ability updates therefore
 cannot be lost to read/write races.
@@ -46,7 +51,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
@@ -73,7 +78,10 @@ from .models import (
     ResponseOut,
     SessionCreate,
     SessionOut,
+    SessionSimilarityOut,
+    SimilarityMatchOut,
 )
+from .similarity import find_similar_sessions
 
 DEFAULT_EXPOSURE_LIMIT = int(os.getenv("DEFAULT_EXPOSURE_LIMIT", "5"))
 
@@ -83,9 +91,10 @@ app = FastAPI(
         "基于 2PL IRT 模型的计算机自适应测验（CAT）："
         "单次 Newton 更新估计能力，信息量最大选题，全局曝光上限控制；"
         "活动会话支持暂停（冻结剩余时限）与恢复（按剩余秒数重算 UTC 截止时间）；"
-        "题目可撤回/启用，撤回题不再参与新取题。"
+        "题目可撤回/启用，撤回题不再参与新取题；"
+        "已结束会话支持答卷雷同复核（同错选项加权相似度）。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -903,6 +912,69 @@ def session_responses(
         theta=session["theta"],
         count=len(rows),
         results=[serialize_response(r) for r in rows],
+    )
+
+
+# -------------------------------------------------------------------------
+# Answer-sheet similarity review
+# -------------------------------------------------------------------------
+
+@app.get(
+    "/api/sessions/{session_id}/similarity",
+    response_model=SessionSimilarityOut,
+    tags=["sessions"],
+)
+def session_similarity(
+    session_id: str,
+    min_shared: int = Query(
+        4, ge=2, le=50, description="候选会话至少共答的题数（2~50）"
+    ),
+    limit: int = Query(
+        20, ge=1, le=50, description="返回的相似会话条数上限（1~50）"
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> SessionSimilarityOut:
+    """Review one finished session for answer-sheet similarity.
+
+    Strictly read-only: no session, exposure or bank row is touched.  The
+    target session must exist (404) and be finished (409); every other
+    *finished* session sharing at least ``min_shared`` answered items is a
+    candidate.  Sheets are aligned by ``item_id``; a shared item is a
+    same-wrong match only when both sessions chose the same option and both
+    stored scores are 0 (correct answers never count).  Each match weighs
+    ``log((item_wrong_total + 2) / (option_wrong_count + 1))`` — the counts
+    come from the frozen ``responses`` of all finished sessions, so editing
+    the bank's correct answers afterwards cannot change the result.  The
+    score is the weight sum divided by the shared-item count; results are
+    ordered by score (desc), same-wrong count (desc), session id (asc) and
+    truncated to ``limit``.  No candidates -> an empty list.
+    """
+    session = get_session_or_404(conn, session_id)
+    if session["status"] != "finished":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "答卷雷同复核仅面向已结束（finished）会话，"
+                f"当前 status={session['status']}"
+            ),
+        )
+    matches = find_similar_sessions(
+        conn, session_id, min_shared=min_shared, limit=limit
+    )
+    return SessionSimilarityOut(
+        session_id=session_id,
+        min_shared=min_shared,
+        limit=limit,
+        count=len(matches),
+        results=[
+            SimilarityMatchOut(
+                session_id=m.session_id,
+                shared_count=m.shared_count,
+                same_wrong_count=m.same_wrong_count,
+                score=m.score,
+            )
+            for m in matches
+        ],
     )
 
 

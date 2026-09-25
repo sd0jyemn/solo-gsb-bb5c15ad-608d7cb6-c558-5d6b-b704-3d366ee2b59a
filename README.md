@@ -14,6 +14,7 @@
 - 支持**题库批量导入与预检** `POST /api/items/import`：一次提交题目数组与 `dry_run`，逐行校验 ID、选项键、答案、难度/区分度、`content_tag` 与批内重复 ID；预检只报告 `created`/`updated` 计划不写库，正式提交在单个 `BEGIN IMMEDIATE` 事务内原子新增或更新（更新保留 `exposure_count` 与启用状态），任一错误整批不变；
 - 支持**题目撤回 / 启用** `PATCH /api/items/{id}/availability`：撤回题不再参与新取题；会话挂起题被撤回后，再次 `/next` 在同一事务内清除挂起项并按既有规则重选（已计曝光不回退）；对撤回题提交新作答返回 `409`（不写答题记录、不更新能力），已保存的 `response_id` 重放仍返回首次结果；
 - 提供**单题质量复盘** `GET /api/items/{id}/analysis`：只统计**已结束会话**的历史作答，并使用作答时冻结保存的 `score`（之后修改题目答案不影响复盘结果）；对每个答过目标题且同场至少另答一题的会话，以「目标题得分 + 同场其余题答对比例」组成样本，返回有效样本数、历史正确率及两者的 Pearson 相关系数（样本少于 5 或任一序列无方差时为 `null`；未知题目 `404`；接口只读）；
+- 提供**答卷雷同复核** `GET /api/sessions/{id}/similarity`：面向**已结束会话**，按 `item_id` 对齐双方历史作答，仅「双方选择同一错误选项」计为同错匹配（正确作答不计），每个匹配按该错误选项在全体已结束会话中的稀有程度加权（`log((该题错误作答总数+2)/(选择该错误选项的次数+1))`），分数为权重之和除以共答题数；候选至少共答 `min_shared` 题（默认 4），按分数、同错数降序及会话 ID 升序返回前 `limit` 条；统计只读 `responses` 中冻结的 `score` 与 `response`，题库改答案后结果不变；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
 ## 目录结构
@@ -21,9 +22,10 @@
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入
+│   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入 / 雷同复核
 │   ├── irt.py         # 2PL 概率、Fisher 信息量、单次 Newton 更新
 │   ├── analysis.py    # 单题质量复盘：历史样本构建与 Pearson 相关系数
+│   ├── similarity.py  # 答卷雷同复核：同错选项加权相似度（已结束会话）
 │   ├── importer.py    # 题库批量导入的逐行校验（ID/选项/答案/难度区分度/标签/重复 ID）
 │   ├── database.py    # SQLite 连接、建表、初始化
 │   ├── models.py      # Pydantic 请求/响应模型
@@ -338,6 +340,51 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 // {"item_id":"ITEM-002","sample_count":3,"correct_rate":1.0,"pearson_correlation":null}
 ```
 
+### 答卷雷同复核（`GET /api/sessions/{id}/similarity`）
+
+只读地复核一份**已结束**答卷与其他已结束会话的雷同程度，用于发现抄袭/串通作答：
+
+- **目标会话**：必须存在（未知返回 **404**）且已结束（`status = finished`；
+  进行中/暂停中的会话返回 **409**）。接口完全只读，不改变任何会话、曝光或题库数据。
+- **候选会话**：所有其他 `finished` 会话；与目标会话按 `item_id` 对齐历史作答，
+  **共同作答的题数（共答数）至少为 `min_shared`**（查询参数，默认 `4`，范围 `2～50`）
+  才进入排名。无候选时返回空列表（`count = 0`）。
+- **同错匹配**：一道共答题仅当**双方选择了同一选项且双方冻结的 `score` 均为 0**
+  （即选了同一个错误选项）时计为一次匹配；答对的题、以及「一方对一方错」或
+  「错但选项不同」的题均不计。
+- **匹配权重**（自然对数，IDF 式——越少人选的错误选项越可疑）：
+
+  ```
+  weight = log((该题已结束会话错误作答总数 + 2) / (选择该错误选项的次数 + 1))
+  ```
+
+  两个计数都来自**已结束会话**在 `responses` 中冻结的 `score` 与 `response`；
+  `+2`/`+1` 平滑保证权重恒为正。
+- **分数**：`score = 同错匹配权重之和 / 共答题数`（除以共答数而非同错数，
+  共答题多本身不会抬高分数）。
+- **返回**：按 **分数降序 → 同错数降序 → 会话 ID 升序** 排列，最多返回
+  `limit` 条（查询参数，默认 `20`，范围 `1～50`）；每条包含
+  `session_id`、`shared_count`（共答数）、`same_wrong_count`（同错数）与 `score`（分数）。
+- **统计与题库解耦**：只读 `responses` 里作答时冻结的 `score`/`response`，
+  之后通过批量导入修改题目正确答案**不会**改变复核结果。
+
+```jsonc
+// GET /api/sessions/<SID>/similarity?min_shared=4&limit=20
+{
+  "session_id": "<SID>",
+  "min_shared": 4,
+  "limit": 20,
+  "count": 2,
+  "results": [
+    {"session_id": "ab12...", "shared_count": 6, "same_wrong_count": 4,
+     "score": 0.156152},
+    {"session_id": "cd34...", "shared_count": 4, "same_wrong_count": 2,
+     "score": 0.122656}
+  ]
+}
+// 无候选：{"session_id":"<SID>","min_shared":4,"limit":20,"count":0,"results":[]}
+```
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -352,6 +399,7 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 | GET  | `/api/sessions/{id}` | 会话状态 |
 | GET  | `/api/sessions/{id}/progress` | **会话进度**（θ、已答数、挂起题、已答题目、暂停状态与剩余秒数） |
 | GET  | `/api/sessions/{id}/responses` | **答题记录**（逐题评分与 θ 轨迹） |
+| GET  | `/api/sessions/{id}/similarity` | **答卷雷同复核**（已结束会话的同错加权相似度排名；`min_shared`/`limit` 可调；只读） |
 | POST | `/api/sessions/{id}/next` | 自适应选下一题 |
 | POST | `/api/sessions/{id}/responses` | 提交答案（幂等，一次 Newton 更新） |
 | POST | `/api/sessions/{id}/pause` | **暂停**活动会话（冻结剩余时限；无时限会话也可暂停） |
@@ -522,6 +570,16 @@ curl -s http://localhost:8000/api/items/ITEM-001/analysis
 # 样本少于 5 或任一序列无方差 -> "pearson_correlation":null
 # 未知题目 -> HTTP 404 {"detail":"item not found"}
 
+# 8) 答卷雷同复核（只读；目标会话须已结束）
+#    min_shared：候选至少共答的题数（默认 4，2~50）；limit：返回条数上限（默认 20，1~50）
+curl -s "http://localhost:8000/api/sessions/$SID/similarity?min_shared=4&limit=20"
+# {"session_id":"...","min_shared":4,"limit":20,"count":1,
+#  "results":[{"session_id":"...","shared_count":6,"same_wrong_count":4,
+#              "score":0.156152}]}
+# 结果按 分数降序 -> 同错数降序 -> 会话 ID 升序 排列；无候选时 results 为空列表
+# 目标会话不存在 -> HTTP 404；目标会话未结束（active/paused）-> HTTP 409；
+# min_shared/limit 越界 -> HTTP 422
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -535,4 +593,5 @@ curl -s http://localhost:8000/api/items/ITEM-001/analysis
 - 曝光计数是**跨会话全局**的：用于模拟真实 CAT 的曝光控制（曝光上限可按会话放宽/收紧）。
 - 暂停/恢复**无需额外配置**：状态与冻结秒数随会话存放在同一 SQLite 库；服务启动时旧库自动迁移（新增 `paused_at` / `remaining_seconds` 列，并把 `status` 的 CHECK 放宽到 `active/paused/finished`），历史会话与答题记录原样保留。所有时间戳均为 **UTC**、秒级精度，因此暂停冻结与恢复重算的截止时间最多有 ±1 秒的取整误差。
 - 题目撤回**无需额外配置**：旧库启动时自动为 `items` 表新增 `is_active` 列（`DEFAULT 1`），**既有题目全部迁移为启用**；撤回只影响新取题与新的作答，历史答题记录、曝光计数与单题复盘统计均不受影响。
+- 答卷雷同复核**无需额外配置**：不新增任何表，直接复用现有 `sessions`/`responses`；只统计 `finished` 会话，且只读作答时冻结的 `score` 与 `response`——题库改答案、题目撤回都不影响复核结果；接口完全只读，可安全地对历史会话随时调用。
 - SQLite + WAL 适合单机/演示与中小流量；写事务已串行化（暂停/恢复同样使用 `BEGIN IMMEDIATE`），水平扩展时可替换连接层。
