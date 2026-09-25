@@ -4,7 +4,7 @@ services:
       context: .
       tags:
         - adaptive-quiz-api:latest
-        - adaptive-quiz-api:1.4.0
+        - adaptive-quiz-api:1.5.0
     image: adaptive-quiz-api:latest
     container_name: adaptive-quiz-api
     ports:

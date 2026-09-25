@@ -332,6 +332,43 @@ class ResponseHistoryOut(BaseModel):
     results: list[ResponseOut]
 
 
+# ---- answer-sheet similarity review ---------------------------------------
+
+class SimilarSessionOut(BaseModel):
+    """一个雷同候选会话及其与目标会话的同错匹配结果。"""
+
+    session_id: str = Field(..., description="候选的已结束会话 ID")
+    shared_count: int = Field(
+        ..., description="共答题数：双方都作答过（不论对错）的题目数量"
+    )
+    same_wrong_count: int = Field(
+        ..., description="同错数：双方在同一题选择了同一错误选项的题目数量"
+    )
+    score: float = Field(
+        ...,
+        description=(
+            "雷同分数：每个同错匹配的权重 "
+            "ln((该题已结束会话错误作答总数+2)/(选择该错误选项次数+1)) "
+            "之和除以共答题数；越高越可疑"
+        ),
+    )
+
+
+class SimilarityOut(BaseModel):
+    """答卷雷同复核结果；无合格候选时 results 为空列表。"""
+
+    session_id: str = Field(..., description="目标会话 ID（已结束）")
+    min_shared: int = Field(..., description="本次采用的最少共答题数门槛")
+    limit: int = Field(..., description="本次返回的候选条数上限")
+    count: int = Field(..., description="实际返回的候选条数")
+    results: list[SimilarSessionOut] = Field(
+        default_factory=list,
+        description=(
+            "相似的已结束会话，按分数降序、同错数降序、会话 ID 升序排列"
+        ),
+    )
+
+
 # ---- progress -------------------------------------------------------------
 
 class ProgressOut(BaseModel):

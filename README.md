@@ -14,6 +14,7 @@
 - 支持**题库批量导入与预检** `POST /api/items/import`：一次提交题目数组与 `dry_run`，逐行校验 ID、选项键、答案、难度/区分度、`content_tag` 与批内重复 ID；预检只报告 `created`/`updated` 计划不写库，正式提交在单个 `BEGIN IMMEDIATE` 事务内原子新增或更新（更新保留 `exposure_count` 与启用状态），任一错误整批不变；
 - 支持**题目撤回 / 启用** `PATCH /api/items/{id}/availability`：撤回题不再参与新取题；会话挂起题被撤回后，再次 `/next` 在同一事务内清除挂起项并按既有规则重选（已计曝光不回退）；对撤回题提交新作答返回 `409`（不写答题记录、不更新能力），已保存的 `response_id` 重放仍返回首次结果；
 - 提供**单题质量复盘** `GET /api/items/{id}/analysis`：只统计**已结束会话**的历史作答，并使用作答时冻结保存的 `score`（之后修改题目答案不影响复盘结果）；对每个答过目标题且同场至少另答一题的会话，以「目标题得分 + 同场其余题答对比例」组成样本，返回有效样本数、历史正确率及两者的 Pearson 相关系数（样本少于 5 或任一序列无方差时为 `null`；未知题目 `404`；接口只读）；
+- 提供**答卷雷同复核** `GET /api/sessions/{id}/similarity`：针对**已结束**会话，按 `item_id` 对齐其他已结束会话的历史作答，**只有双方在同一题选择了同一个错误选项**才计为同错匹配（任一方答对不计）；候选至少共答 `min_shared` 道题（默认 4，范围 2～50），每个同错匹配权重为 `ln((该题已结束会话错误作答总数+2)/(选择该错误选项的次数+1))`，分数为权重之和除以共答题数；按分数、同错数降序及会话 ID 升序返回前 `limit` 条（默认 20，范围 1～50），含共答数、同错数与分数；统计只用 `responses` 中冻结的 `score` 与 `response`，题库改答案后结果不变；未知会话 `404`、未结束会话 `409`、无候选返回空列表（接口只读）；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
 ## 目录结构
@@ -24,6 +25,7 @@
 │   ├── main.py        # FastAPI 路由：会话 / 选题 / 作答 / 暂停恢复 / 进度 / 记录 / 批量导入
 │   ├── irt.py         # 2PL 概率、Fisher 信息量、单次 Newton 更新
 │   ├── analysis.py    # 单题质量复盘：历史样本构建与 Pearson 相关系数
+│   ├── similarity.py  # 答卷雷同复核：已结束会话按 item_id 对齐、同错匹配加权打分
 │   ├── importer.py    # 题库批量导入的逐行校验（ID/选项/答案/难度区分度/标签/重复 ID）
 │   ├── database.py    # SQLite 连接、建表、初始化
 │   ├── models.py      # Pydantic 请求/响应模型
@@ -338,6 +340,65 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 // {"item_id":"ITEM-002","sample_count":3,"correct_rate":1.0,"pearson_correlation":null}
 ```
 
+### 答卷雷同复核（`GET /api/sessions/{id}/similarity`）
+
+只读地把一份**已结束**答卷与其他已结束会话比对，找出同错作答模式相似的会话，
+用于考后疑似雷同卷复核：
+
+- **按 `item_id` 对齐**双方历史作答：某题只有双方都作答过才计入「共答」，
+  共答题数 `shared_count` 不看对错（一方答对、另一方答错也算共答）。
+  候选至少共答 **`min_shared`** 道题（默认 **4**，范围 **2～50**）才入选。
+- **只计同错匹配**：某题双方都答错、且选择了**同一个错误选项**时，
+  `same_wrong_count` 加 1；双方都答对、或只有一方答错均**不计**匹配。
+- **同错权重（少数派错选更可疑）**：每个同错匹配的权重为
+
+  ```
+  w(item, option) = ln( (E_item + 2) / (N_item_option + 1) )
+  ```
+
+  其中 `E_item` 是**已结束会话**在该题上的错误作答总数，`N_item_option`
+  是其中选择该错误选项的次数。大家都掉进去的常见干扰项权重低，只有雷同双方
+  选择的冷门错项权重高（始终为正值）。
+- **分数 `score`** = 命中的同错权重之和 / 共答题数。按 **分数降序 →
+  同错数降序 → 会话 ID 升序** 返回前 **`limit`** 条（默认 **20**，范围
+  **1～50**）；每条含 `session_id`、`shared_count`、`same_wrong_count`、`score`。
+- **冻结作答、题库改答案不影响结果**：统计只读取 `responses` 中作答时保存的
+  `score`（当时对/错）与 `response`（当时选择的选项），不按题库当前答案重新判分；
+  之后通过批量导入修改题目答案，雷同复核结果保持一致。进行中/暂停中的会话
+  既不能作为目标，也不会成为候选。
+- **状态码**：未知目标会话返回 **HTTP 404**；目标会话未结束
+  （`active`/`paused`）返回 **HTTP 409**；`min_shared`、`limit` 越界返回
+  **HTTP 422**；没有合格候选时正常返回 **HTTP 200** 且 `results` 为空列表。
+- 接口完全只读：不创建/结束会话、不改变曝光计数、不写题库。
+
+```jsonc
+// GET /api/sessions/3f1a.../similarity?min_shared=4&limit=20
+{
+  "session_id": "3f1a...",
+  "min_shared": 4,
+  "limit": 20,
+  "count": 2,
+  "results": [
+    {
+      "session_id": "9c2b...",
+      "shared_count": 10,       // 双方都作答过 10 道题（不论对错）
+      "same_wrong_count": 4,    // 其中 4 道题选择了同一个错误选项
+      "score": 0.17358342951798789
+    },
+    {
+      "session_id": "b77d...",
+      "shared_count": 8,
+      "same_wrong_count": 2,
+      "score": 0.06166027193090334
+    }
+  ]
+}
+// 无合格候选：{"session_id":"...","min_shared":4,"limit":20,"count":0,"results":[]}
+// 未知会话 -> HTTP 404 {"detail":"session not found"}
+// 未结束会话 -> HTTP 409 {"detail":"只有已结束（finished）的会话才能进行答卷雷同复核，当前 status=active"}
+```
+
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -352,6 +413,7 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 | GET  | `/api/sessions/{id}` | 会话状态 |
 | GET  | `/api/sessions/{id}/progress` | **会话进度**（θ、已答数、挂起题、已答题目、暂停状态与剩余秒数） |
 | GET  | `/api/sessions/{id}/responses` | **答题记录**（逐题评分与 θ 轨迹） |
+| GET  | `/api/sessions/{id}/similarity` | **答卷雷同复核**（对齐已结束会话的同错匹配、加权分数；只读） |
 | POST | `/api/sessions/{id}/next` | 自适应选下一题 |
 | POST | `/api/sessions/{id}/responses` | 提交答案（幂等，一次 Newton 更新） |
 | POST | `/api/sessions/{id}/pause` | **暂停**活动会话（冻结剩余时限；无时限会话也可暂停） |
@@ -521,6 +583,15 @@ curl -s http://localhost:8000/api/items/ITEM-001/analysis
 #  "pearson_correlation":0.7144}
 # 样本少于 5 或任一序列无方差 -> "pearson_correlation":null
 # 未知题目 -> HTTP 404 {"detail":"item not found"}
+
+# 8) 答卷雷同复核（只读；$SID 必须是已结束会话；服务默认监听本机 8000 端口）
+#    min_shared 默认 4（范围 2~50），limit 默认 20（范围 1~50）
+curl -s "http://localhost:8000/api/sessions/$SID/similarity"
+curl -s "http://localhost:8000/api/sessions/$SID/similarity?min_shared=2&limit=10"
+# {"session_id":"...","min_shared":4,"limit":20,"count":2,"results":[
+#   {"session_id":"...","shared_count":10,"same_wrong_count":4,"score":0.1736},
+#   {"session_id":"...","shared_count":8,"same_wrong_count":2,"score":0.0617}]}
+# 无候选 -> HTTP 200 且 "results":[]；未知会话 -> HTTP 404；未结束（active/paused）-> HTTP 409
 
 ## 环境变量
 
